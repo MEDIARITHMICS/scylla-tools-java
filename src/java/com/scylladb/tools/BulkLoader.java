@@ -41,26 +41,20 @@
 
 package com.scylladb.tools;
 
-import static com.datastax.driver.core.Cluster.builder;
-import static com.scylladb.tools.BulkLoader.Verbosity.Normal;
-import static com.scylladb.tools.SSTableToCQL.TIMESTAMP_VAR_NAME;
-import static com.scylladb.tools.SSTableToCQL.TTL_VAR_NAME;
-import static com.scylladb.tools.SSTableToCQL.cqlEscape;
-import static java.lang.Thread.currentThread;
-import static org.apache.cassandra.io.sstable.format.SSTableReader.openForBatch;
-import static org.apache.cassandra.schema.CQLTypeParser.parse;
-
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
+import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.io.Writer;
 import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.MalformedURLException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.security.KeyManagementException;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -86,48 +80,18 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.CFMetaData.DroppedColumn;
-import org.apache.cassandra.config.Config;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.EncryptionOptions;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.YamlConfigurationLoader;
-import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.cql3.FieldIdentifier;
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.cql3.UTName;
-import org.apache.cassandra.cql3.statements.CFStatement;
-import org.apache.cassandra.cql3.statements.CreateTableStatement;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.BytesType;
-import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.dht.Token.TokenFactory;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.io.sstable.Component;
-import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.ISSTableScanner;
-import org.apache.cassandra.io.sstable.SSTable;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.schema.Types;
-import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Pair;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.RateLimiter;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.GnuParser;
@@ -171,17 +135,54 @@ import com.datastax.driver.core.UserType;
 import com.datastax.driver.core.WriteType;
 import com.datastax.driver.core.exceptions.CodecNotFoundException;
 import com.datastax.driver.core.exceptions.DriverException;
-import com.datastax.driver.core.exceptions.InvalidQueryException;
 import com.datastax.driver.core.exceptions.InvalidTypeException;
 import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
 import com.datastax.driver.core.policies.RetryPolicy;
 import com.datastax.driver.core.policies.TokenAwarePolicy;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.MoreExecutors;
-import com.google.common.util.concurrent.RateLimiter;
 import com.scylladb.tools.SSTableToCQL.Statistics;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.CFMetaData.DroppedColumn;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.YamlConfigurationLoader;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.FieldIdentifier;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UTName;
+import org.apache.cassandra.cql3.statements.CFStatement;
+import org.apache.cassandra.cql3.statements.CreateTableStatement;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.dht.Token.TokenFactory;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Types;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+import static com.datastax.driver.core.Cluster.builder;
+import static com.scylladb.tools.BulkLoader.Verbosity.Normal;
+import static com.scylladb.tools.SSTableToCQL.TIMESTAMP_VAR_NAME;
+import static com.scylladb.tools.SSTableToCQL.TTL_VAR_NAME;
+import static com.scylladb.tools.SSTableToCQL.cqlEscape;
+import static java.lang.Thread.currentThread;
+import static org.apache.cassandra.io.sstable.format.SSTableReader.openForBatch;
+import static org.apache.cassandra.schema.CQLTypeParser.parse;
 
 public class BulkLoader {
     public static class InfiniteRetryPolicy implements RetryPolicy {
@@ -272,7 +273,7 @@ public class BulkLoader {
 
     @SuppressWarnings("serial")
     private static class StopExecution extends Error {}
-    
+
     private static class CQLClient implements Client {
         private static final ProtocolVersion PROTOCOL_VERSION = ProtocolVersion.V4;
 
@@ -301,9 +302,9 @@ public class BulkLoader {
         private final Metrics metrics;
 
         private PrintStream out = System.out;
-        
+
         private volatile boolean failed = false;
-        
+
         public CQLClient(LoaderOptions options, String keyspace)
                 throws NoSuchAlgorithmException, FileNotFoundException, IOException, KeyStoreException,
                 CertificateException, UnrecoverableKeyException, KeyManagementException, ConfigurationException {
@@ -329,7 +330,7 @@ public class BulkLoader {
             this.metrics = new Metrics();
             this.codecRegistry = new CodecRegistry();
             this.blob = codecRegistry.codecFor(ByteBuffer.allocate(1));
-            
+
             Cluster.Builder builder = builder().addContactPoints(options.hosts).withProtocolVersion(PROTOCOL_VERSION)
                     .withCompression(Compression.LZ4).withPoolingOptions(poolingOptions)
                     .withLoadBalancingPolicy(new TokenAwarePolicy(DCAwareRoundRobinPolicy.builder().build()))
@@ -427,16 +428,16 @@ public class BulkLoader {
             }
             if (parent != null) {
                 parent.checkStop();
-            }            
+            }
         }
-        
+
         public void signalFailure() {
             failed = true;
             if (parent != null) {
                 parent.signalFailure();
             }
         }
-        
+
         // Load user defined types. Since loading a UDT entails validation
         // of the field types against known types, we may fail to load a UDT if
         // it references a UDT that has not yet been loaded. So we run a
@@ -475,10 +476,10 @@ public class BulkLoader {
 
                 types.build().forEach(Schema.instance::addType);
             }
-            
+
             udts.forEach(this::bindUserTypeCodec);
         }
-        
+
         private void bindUserTypeCodec(DataType t) {
             // Cassandra drivers assume incoming bound data for UDT is 
             // an actual object looking like the type. In our case, we will 
@@ -525,7 +526,7 @@ public class BulkLoader {
         /**
          * Creates a codec for a Cassandra {@link AbstractType} instance
          * We get these for certain types (date) via a {@link CustomType}
-         * through the drivers statement prepare. Annoying, but easy to bind... 
+         * through the drivers statement prepare. Annoying, but easy to bind...
          */
         private <T> void bindCustomType(DataType ct, final AbstractType<T> atype) {
             codecRegistry.register(new TypeCodec<T>(ct, atype.getSerializer().getType()) {
@@ -616,7 +617,7 @@ public class BulkLoader {
 
         private void send(final Statement s) {
             checkStop();
-            
+
             if (simulate) {
                 return;
             }
@@ -678,7 +679,7 @@ public class BulkLoader {
                 send(s);
             }
         }
-  
+
         private final Map<Pair<String, String>, CFMetaData> cfMetaDatas = new HashMap<>();
 
         private static final String SELECT_DROPPED_COLUMNS = "SELECT * FROM system_schema.dropped_columns";
@@ -834,7 +835,7 @@ public class BulkLoader {
         private void sendPrepared(final DecoratedKey key, final long timestamp, String what,
                 final Map<String, Object> objects, final boolean allowBatch) {
             checkStop();
-            
+
             ListenableFuture<PreparedStatement> f = preparedStatements.computeIfAbsent(what, k -> {
                 if (verbose.greaterOrEqual(Verbosity.Chatty)) {
                     out.println("Preparing: " + k + " on thread " + Thread.currentThread().getId());
@@ -1051,6 +1052,8 @@ public class BulkLoader {
 
                 LoaderOptions opts = new LoaderOptions(dir);
 
+                opts.alreadyProcessedFiles = new File("./progress-data");
+
                 if (cmd.hasOption(VERBOSE_OPTION)) {
                     try {
                         int level = Integer.parseInt(cmd.getOptionValue(VERBOSE_OPTION, "2"));
@@ -1091,7 +1094,7 @@ public class BulkLoader {
                         if (columnNamesMappings.containsKey(sourceName)) {
                             throw new RuntimeException("Mapping is not unique, key already exists: " + sourceName);
                         }
-                        columnNamesMappings.put(sourceName, targetName);                        
+                        columnNamesMappings.put(sourceName, targetName);
                     }
                     opts.columnNamesMapping = new ColumnNamesMapping(columnNamesMappings);
                 }
@@ -1254,6 +1257,7 @@ public class BulkLoader {
         }
 
         public final File directory;
+        public File alreadyProcessedFiles;
         public boolean ssl;
         public boolean debug;
         public Verbosity verbose = Verbosity.Normal;
@@ -1272,7 +1276,7 @@ public class BulkLoader {
         public boolean prepare;
 
         public String tokenRanges;
-        
+
         public ConsistencyLevel consistencyLevel = ConsistencyLevel.ONE;
 
         public EncryptionOptions encOptions = new EncryptionOptions.ClientEncryptionOptions();
@@ -1366,18 +1370,25 @@ public class BulkLoader {
 
             final Map<InetAddress, Collection<Range<Token>>> ranges = getRanges(options, client);
             final List<Pair<Descriptor, Set<Component>>> files = findFiles(keyspace, dir);
-            final ConcurrentLinkedQueue<SSTableToCQL> tasks = new ConcurrentLinkedQueue<>();
+            final ConcurrentLinkedQueue<Pair<SSTableToCQL, Descriptor>> tasks = new ConcurrentLinkedQueue<>();
             final CountDownLatch latch = new CountDownLatch(options.threadCount);
             final List<SSTableToCQL.Statistics> stats = new ArrayList<>();
 
+            final ConcurrentHashMap<String, AtomicInteger> descriptorShardProcessed = new ConcurrentHashMap<>();
+            if(options.alreadyProcessedFiles.exists()) {
+                final List<String> alreadyProcessedFiles = Files.readAllLines(options.alreadyProcessedFiles.toPath());
+                alreadyProcessedFiles.forEach(file ->
+                                              descriptorShardProcessed.put(file, new AtomicInteger(0))
+                );
+            }
             long totalBytes = ranges.size() * files.stream().mapToLong((p) -> {
                 return new File(p.left.filenameFor(Component.DATA)).length();
             }).sum();
-            
+
             for (int i = 0; i < options.threadCount; ++i) {
                 executor.submit(() -> {
                     try {
-                        process(options, keyspace, tasks, files, ranges, client, stats);
+                        process(options, keyspace, tasks, files, ranges, client, stats, descriptorShardProcessed);
                     } finally {
                         latch.countDown();
                     }
@@ -1526,7 +1537,7 @@ public class BulkLoader {
         }
         return Pair.create(desc, components);
     }
-    
+
     public static SSTableReader openFile(Pair<Descriptor, Set<Component>> p, CFMetaData cfm) {
         try {
             // To conserve memory, open SSTableReaders without bloom
@@ -1539,13 +1550,13 @@ public class BulkLoader {
         } catch (IOException e) {
             logger.warn("Skipping file {}, error opening it: {}", p.left.baseFilename(), e.getMessage());
         }
-        return null;        
+        return null;
     }
 
     // Main processing loop for worker thread, broken out into function
-    private static void process(LoaderOptions options, String keyspace, ConcurrentLinkedQueue<SSTableToCQL> tasks,
+    private static void process(LoaderOptions options, String keyspace, ConcurrentLinkedQueue<Pair<SSTableToCQL, Descriptor>> tasks,
             List<Pair<Descriptor, Set<Component>>> files, Map<InetAddress, Collection<Range<Token>>> ranges,
-            CQLClient client, List<SSTableToCQL.Statistics> stats) {
+            CQLClient client, List<SSTableToCQL.Statistics> stats, ConcurrentHashMap<String, AtomicInteger> descriptorShardProcessed) {
         // always use a copy of the client to keep from
         // colliding with other threads.
         final CQLClient c = client.copy();
@@ -1553,14 +1564,24 @@ public class BulkLoader {
             boolean triedFiles = false;
             while (!Thread.interrupted()) {
                 c.checkStop();
-                
+
                 // First try to get a ready task to process (i.e.
                 // sstable slice)
-                SSTableToCQL t;
+                Pair<SSTableToCQL, Descriptor> t;
                 if ((t = tasks.poll()) != null) {
-                    SSTableToCQL.Statistics s = t.run(c, options);
+                    SSTableToCQL.Statistics s = t.left.run(c, options);
                     synchronized (stats) {
                         stats.add(s);
+                        if(descriptorShardProcessed.get(t.right.baseFilename()).decrementAndGet() == 0) {
+                            descriptorShardProcessed.remove(t.right.baseFilename());
+                            if (client.verbose.greaterOrEqual(Verbosity.Verbose)) {
+                                client.out.println("Finished processing sstable " + t.right.baseFilename());
+                                Writer w = new FileWriter(options.alreadyProcessedFiles, true);
+                                w.write(t.right.baseFilename() + "\n");
+                                w.flush();
+                                w.close();
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1579,66 +1600,70 @@ public class BulkLoader {
                             continue; // see if any tasks.
                         }
                         Pair<Descriptor, Set<Component>> p = files.remove(0);
-                        CFMetaData cfm = options.columnNamesMapping.getMetadata(client.getCFMetaData(keyspace, p.left.cfname));
-                        SSTableReader r = openFile(p, cfm);
-                        if (r != null) {
-                            // We could open it. Turn into tasks and submit to
-                            // workers.
-                            if (client.verbose.greaterOrEqual(Verbosity.Verbose)) {
-                                client.out.println("Adding sstable " + p.left.baseFilename());
-                            }
-                            for (Map.Entry<InetAddress, Collection<Range<Token>>> e : ranges.entrySet()) {
-                                SStableScannerSource src = new DefaultSSTableScannerSource(r, e.getValue()) {
-                                    @Override
-                                    public ISSTableScanner scanner() {
-                                        ISSTableScanner scanner = super.scanner();
-                                        
-                                        /*
-                                         * If the data is compressed, we don't know 
-                                         * the actual data size we'll process until
-                                         * getting here. 
-                                         * 
-                                         * Add the difference between perceived 
-                                         * file size and actual data length
-                                         * to the "additional" metrics field. 
-                                         * and let parent thread add this to 
-                                         * the total bytes. 
-                                         * 
-                                         * Note that this can have the unfortunate
-                                         * result of making the percentage counter
-                                         * go backwards sometimes (esp. early on),
-                                         * but it is not 100% accurate anyway (due
-                                         * to pk ranges etc). 
-                                         */
-                                        long l1 = scanner.getLengthInBytes();
-                                        long l2 = scanner.getCompressedLengthInBytes();
-                                        c.metrics.additionalBytes += l1 - l2;
-                                        return new SSTableScannerWrapper(scanner) {
-                                            private long last = getBytesScanned();
-                                            
-                                            private void updatePos() {
-                                                long pos = getBytesScanned();
-                                                long diff = pos - last;
-                                                last = pos;
-                                                c.metrics.bytesProcessed += diff;
-                                            }
+                        if(descriptorShardProcessed.get(p.left.baseFilename()) == null) {
+                            CFMetaData cfm = options.columnNamesMapping.getMetadata(client.getCFMetaData(keyspace, p.left.cfname));
+                            SSTableReader r = openFile(p, cfm);
+                            if (r != null) {
+                                // We could open it. Turn into tasks and submit to
+                                // workers.
+                                if (client.verbose.greaterOrEqual(Verbosity.Verbose)) {
+                                    client.out.println("Adding sstable " + p.left.baseFilename());
+                                }
 
-                                            @Override
-                                            public void close() {
-                                                updatePos();
-                                                super.close();
-                                            }
-                                            @Override
-                                            public UnfilteredRowIterator next() {
-                                                updatePos();
-                                                return super.next();
-                                            }                                            
-                                        };                                        
-                                    }
-                                };
-                                tasks.add(new SSTableToCQL(src));
+                                descriptorShardProcessed.put(p.left.baseFilename(), new AtomicInteger(ranges.size()));
+                                for (Map.Entry<InetAddress, Collection<Range<Token>>> e : ranges.entrySet()) {
+                                    SStableScannerSource src = new DefaultSSTableScannerSource(r, e.getValue()) {
+                                        @Override
+                                        public ISSTableScanner scanner() {
+                                            ISSTableScanner scanner = super.scanner();
+
+                                            /*
+                                             * If the data is compressed, we don't know
+                                             * the actual data size we'll process until
+                                             * getting here.
+                                             *
+                                             * Add the difference between perceived
+                                             * file size and actual data length
+                                             * to the "additional" metrics field.
+                                             * and let parent thread add this to
+                                             * the total bytes.
+                                             *
+                                             * Note that this can have the unfortunate
+                                             * result of making the percentage counter
+                                             * go backwards sometimes (esp. early on),
+                                             * but it is not 100% accurate anyway (due
+                                             * to pk ranges etc).
+                                             */
+                                            long l1 = scanner.getLengthInBytes();
+                                            long l2 = scanner.getCompressedLengthInBytes();
+                                            c.metrics.additionalBytes += l1 - l2;
+                                            return new SSTableScannerWrapper(scanner) {
+                                                private long last = getBytesScanned();
+
+                                                private void updatePos() {
+                                                    long pos = getBytesScanned();
+                                                    long diff = pos - last;
+                                                    last = pos;
+                                                    c.metrics.bytesProcessed += diff;
+                                                }
+
+                                                @Override
+                                                public void close() {
+                                                    updatePos();
+                                                    super.close();
+                                                }
+                                                @Override
+                                                public UnfilteredRowIterator next() {
+                                                    updatePos();
+                                                    return super.next();
+                                                }
+                                            };
+                                        }
+                                    };
+                                    tasks.add(Pair.create(new SSTableToCQL(src), p.left));
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
