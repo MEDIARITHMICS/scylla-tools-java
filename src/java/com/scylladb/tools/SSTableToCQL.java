@@ -77,13 +77,13 @@ import com.google.common.collect.MultimapBuilder;
 
 /**
  * Basic sstable -> CQL statements translator.
- * 
+ *
  * Goes through a table, in token range order if possible, and tries to generate
  * CQL delete/update statements to match the perceived sstable atom cells read.
- * 
+ *
  * This works fairly ok for most normal types, as well as frozen collections.
  * However, it breaks down completely for non-frozen lists.
- * 
+ *
  * In cassandra, a list is stored as actually a "map" of time UUID -> value.
  * Since maps in turn are just prefixed thrift column names (the key is part of
  * column name), UUID sorting makes sure the list remains in order. However,
@@ -92,14 +92,14 @@ import com.google.common.collect.MultimapBuilder;
  * forwards b.) Might not be reading all relevant sstables we have no idea what
  * is actually in the CQL list. Thus we cannot generate any of the valid
  * expressions to manipulate the list in question.
- * 
+ *
  * As a "workaround", the code will instead generate map expressions, using the
  * actual time UUID keys for all list ops. This is of course bogus, and indeed
  * will result in wild errors from for example Origin getting any such
  * statements.
- * 
+ *
  * Compact storage column families are not handled yet.
- * 
+ *
  */
 public class SSTableToCQL {
     public static final String TIMESTAMP_VAR_NAME = "timestamp";
@@ -113,6 +113,10 @@ public class SSTableToCQL {
         public boolean setAllColumns;
         public ColumnNamesMapping columnNamesMapping = new ColumnNamesMapping(emptyMap());
         public boolean ignoreDroppedCounterData;
+        public boolean timestampRangeCheck;
+        public long timestampLowerBound;
+        public long timestampUpperBound;
+
     }
 
     public static class Statistics {
@@ -134,7 +138,7 @@ public class SSTableToCQL {
             remoteCountersSkipped += s.remoteCountersSkipped;
         }
     }
-    
+
     /**
      * SSTable row worker.
      *
@@ -298,10 +302,10 @@ public class SSTableToCQL {
                     if (state.isGlobal()) {
                         int type = 'g';
                         list.add(TupleType.buildValue(new ByteBuffer[] { Int32Type.instance.getSerializer().serialize(type),
-                                state.getCounterId().bytes(),                            
+                                state.getCounterId().bytes(),
                                 LongType.instance.getSerializer().serialize(state.getClock()),
                                 LongType.instance.getSerializer().serialize(state.getCount())
-    
+
                         }));
                     } else if (!options.ignoreDroppedCounterData) {
                         throw new RuntimeException(
@@ -314,7 +318,7 @@ public class SSTableToCQL {
 
                     state.moveToNext();
                 }
-                
+
                 params.put(varName, list);
                 return " = SCYLLA_COUNTER_SHARD_LIST(:" + varName + ")";
             }
@@ -326,7 +330,7 @@ public class SSTableToCQL {
         private final Client client;
         private final Options options;
         private final Statistics stats = new Statistics();
-        
+
         Op op;
         CFMetaData cfMetaData;
         DecoratedKey key;
@@ -345,16 +349,16 @@ public class SSTableToCQL {
             GreaterEqual(">="),
             Greater(">"),
             LessEqual("<="),
-            Less("<"),        
+            Less("<"),
             ;
-            
+
             private String s;
             private Comp(String s) {
                 this.s = s;
             }
             public String toString() {
                 return s;
-            }            
+            }
         }
         // sorted atoms?
 
@@ -371,7 +375,7 @@ public class SSTableToCQL {
         public Statistics getStatistics() {
             return stats;
         }
-        
+
         private static class ClusteringWhere {
             private final List<ColumnDefinition> columnDefs;
             private final List<Object> lowBounds;
@@ -460,9 +464,9 @@ public class SSTableToCQL {
         }
         private void endRow() {
             this.row = null;
-            this.rowDelete = false;            
+            this.rowDelete = false;
         }
-        
+
         private void clear() {
             op = Op.NONE;
             values.clear();
@@ -475,8 +479,8 @@ public class SSTableToCQL {
         void deleteCqlRow(ClusteringBound start, ClusteringBound end, long timestamp) {
             if (!values.isEmpty()) {
                 finish();
-            }            
-            setOp(Op.DELETE, timestamp, invalidTTL);                        
+            }
+            setOp(Op.DELETE, timestamp, invalidTTL);
             setWhere(start, end);
             finish();
             ++stats.rowsDeleted;
@@ -496,7 +500,11 @@ public class SSTableToCQL {
                 clear();
                 return;
             }
-
+            // We can ignore timestamps between a range
+            if (options.timestampRangeCheck && (timestamp < options.timestampLowerBound || timestamp > options.timestampUpperBound)) {
+                clear();
+                return;
+            }
 
             checkRowClustering();
 
@@ -504,7 +512,7 @@ public class SSTableToCQL {
             StringBuilder buf = new StringBuilder();
 
             buf.append(op.toString());
-            
+
             if (op == Op.UPDATE) {
                 writeColumnFamily(buf);
                 // Timestamps can be sent using statement options.
@@ -676,7 +684,7 @@ public class SSTableToCQL {
         }
 
         private final Map<Pair<ColumnDefinition, Integer>, String> variableNames = new HashMap<>();
-        
+
         private String varName(ColumnDefinition c, int instanceNumber) {
             Pair<ColumnDefinition, Integer> entryPair = Pair.create(c, instanceNumber);
             String name = variableNames.get(entryPair);
@@ -703,20 +711,20 @@ public class SSTableToCQL {
                 if (adjustedTTL == LivenessInfo.EXPIRED_LIVENESS_TTL) {
                     adjustedTTL = 1;
                 }
-                
+
                 if (timestamp == invalidTimestamp) {
                     buf.append("USING ");
                 } else {
                     buf.append("AND ");
-                    
-                    long exp = SECONDS.convert(timestamp, MICROSECONDS) + ttl; 
-                    long now = SECONDS.convert(System.currentTimeMillis(), MILLISECONDS); 
+
+                    long exp = SECONDS.convert(timestamp, MICROSECONDS) + ttl;
+                    long now = SECONDS.convert(System.currentTimeMillis(), MILLISECONDS);
 
                     if (exp < now) {
                         adjustedTTL = 1; // 0 -> no ttl. 1 should disappear fast enoug
                     } else {
                         adjustedTTL = (int)Math.min(adjustedTTL, exp - now);
-                    }                    
+                    }
                 }
                 buf.append(" TTL :" + TTL_VAR_NAME);
 
@@ -739,7 +747,7 @@ public class SSTableToCQL {
             if (timestamp != invalidTimestamp || setAllColumns) {
                 ensureWhitespace(buf);
                 buf.append("USING TIMESTAMP :" + TIMESTAMP_VAR_NAME);
-            } 
+            }
             if (timestamp != invalidTimestamp) {
                 params.put(TIMESTAMP_VAR_NAME, timestamp);
             }
@@ -789,7 +797,7 @@ public class SSTableToCQL {
                 endRow();
             }
         }
-        
+
         private void checkRowClustering() {
             if (row == null) {
                 return;
@@ -815,32 +823,32 @@ public class SSTableToCQL {
                     }
                 }
 
-            }            
+            }
         }
         // process an actual cell (data or tombstone)
         private void process(Cell cell, LivenessInfo liveInfo, DeletionTime d) {
             ColumnDefinition c = cell.column();
 
             this.allowTTL = true;
-            
+
             if (logger.isTraceEnabled()) {
                 logger.trace("Processing {}", c.name);
             }
-            
+
             AbstractType<?> type = c.type;
             ColumnOp cop = null;
 
             boolean live = !cell.isTombstone() && (d == null || d.isLive());
-            
+
             try {
                 if (cell.path() != null && cell.path().size() > 0) {
                     CollectionType<?> ctype = (CollectionType<?>) type;
-                    
+
                     Object key = ctype.nameComparator().compose(cell.path().get(0));
                     Object val = live ? cell.column().cellValueType().compose(cell.value()) : null;
 
                     finish();
-                    
+
                     switch (ctype.kind) {
                     case MAP:
                         cop = new SetMapEntry(key, val);
@@ -855,7 +863,7 @@ public class SSTableToCQL {
                 } else if (live && type.isCounter()) {
                     finish();
                     cop = new SetCounterEntry(type, cell.value());
-                    this.allowTTL = false;                   
+                    this.allowTTL = false;
                 } else if (live) {
                     cop = new SetColumn(type.compose(cell.value()));
                 } else {
@@ -869,7 +877,7 @@ public class SSTableToCQL {
 
             updateColumn(c, cop, cell.timestamp(), cell.ttl());
         }
-        
+
         // Process an SSTable row (partial partition)
         private void process(UnfilteredRowIterator rows) {
             CFMetaData cfMetaData = rows.metadata();
@@ -887,7 +895,7 @@ public class SSTableToCQL {
             if (sr != null) {
                 process(sr);
             }
-            
+
             while (rows.hasNext()) {
                 Unfiltered f = rows.next();
                 switch (f.kind()) {
@@ -904,7 +912,7 @@ public class SSTableToCQL {
                     process((Row)f);
                     break;
                 default:
-                    break;                
+                    break;
                 }
             }
         }
@@ -1035,14 +1043,14 @@ public class SSTableToCQL {
     private static final Logger logger = LoggerFactory.getLogger(SSTableToCQL.class);
 
     private final SStableScannerSource source;
-    
+
     public SSTableToCQL(SStableScannerSource source) {
         this.source = source;
     }
 
-    /** 
-     * Performs the transformation of the SSTable to CQL statements. 
-     * This can be called exactly once. 
+    /**
+     * Performs the transformation of the SSTable to CQL statements.
+     * This can be called exactly once.
      * @param client
      */
     public Statistics run(Client client, Options options) {

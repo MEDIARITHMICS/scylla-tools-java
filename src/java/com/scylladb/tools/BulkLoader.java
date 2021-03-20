@@ -1012,6 +1012,8 @@ public class BulkLoader {
             options.addOption("tr", TOKEN_RANGES, "<lo>:<hi>,...", "import only partitions that satisfy lo < token(partition) <= hi");
 
             options.addOption("pt", PARTITIONER_TYPE, "class", "Partitioner type to use, defaults to cluster value");
+            options.addOption("tsbl", TIMESTAMP_LOWER_BOUND, "timestamp in ms", "timestamp lower bound");
+            options.addOption("tsbu", TIMESTAMP_UPPER_BOUND, "timestamp in ms", "timestamp upper bound");
 
             return options;
         }
@@ -1209,6 +1211,17 @@ public class BulkLoader {
                 if (cmd.hasOption(USE_UNSET)) {
                     opts.setAllColumns = true;
                 }
+
+
+                if (cmd.hasOption(TIMESTAMP_LOWER_BOUND)) {
+                    opts.timestampLowerBound = Long.parseLong(cmd.getOptionValue(TIMESTAMP_LOWER_BOUND));
+                    opts.timestampRangeCheck = true;
+                }
+                if (cmd.hasOption(TIMESTAMP_UPPER_BOUND)) {
+                    opts.timestampUpperBound = Long.parseLong(cmd.getOptionValue(TIMESTAMP_UPPER_BOUND));
+                    opts.timestampRangeCheck = true;
+                }
+
                 if (cmd.hasOption(IGNORE_MISSING_COLUMNS)) {
                     opts.ignoreColumns.addAll(Arrays.asList(cmd.getOptionValue(IGNORE_MISSING_COLUMNS).split(",")));
                 }
@@ -1318,6 +1331,8 @@ public class BulkLoader {
 
     private static final String USE_UNSET = "use-unset";
     private static final String TOKEN_RANGES = "token-ranges";
+    private static final String TIMESTAMP_LOWER_BOUND = "timestamp-lower-bound";
+    private static final String TIMESTAMP_UPPER_BOUND = "timestamp-upper-bound";
 
     private static final String PARTITIONER_TYPE = "partitioner";
 
